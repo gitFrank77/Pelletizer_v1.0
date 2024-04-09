@@ -17,19 +17,20 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
+//#include "stm32f401xe.h"
 #include "main.h"
 #include <stdio.h>
 #include "FreeRTOS.h"
 #include "semphr.h"
 #include "task.h"
 
+#define SERVO_DELAY		5000
 
-#define left_limit_offset = 500;
-#define right_limit_offset = 350;
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM4_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 TIM_HandleTypeDef htim4;
 /* USER CODE END PFP */
@@ -37,24 +38,21 @@ TIM_HandleTypeDef htim4;
 static void task1_handler(void *parameters);
 static void task2_handler(void *parameters);
 static void task3_handler(void *parameters);
-static void task4_handler(void *parameters);
+
 static void task5_handler(void *parameters);
 
 
 xSemaphoreHandle xMutex1;
+ADC_HandleTypeDef hadc1;
 
 
 //--[Global variables]
-volatile unsigned int stepper_counter    = 0;
-volatile unsigned int left_limit_status  = 0;
-volatile unsigned int left_limit_value   = 0;
-volatile unsigned int right_limit_status = 0;
-volatile unsigned int right_limit_value  = 0;
-volatile unsigned int stepper_status = 0;
+
 volatile unsigned int process_step = 0;
 volatile unsigned int process_counter = 0;
 volatile unsigned int pump_status = 0;
-
+volatile unsigned int my_adc = 0;
+volatile unsigned int my_adc_delay = 0;
 int main(void)
 {
 
@@ -63,13 +61,15 @@ int main(void)
   SystemClock_Config();
   MX_GPIO_Init();
   MX_TIM4_Init();
+  MX_ADC1_Init();
 
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
 
-  TaskHandle_t task1_handle;//calibrations
-  TaskHandle_t task2_handle;//process: stepper motor calibration
+  TaskHandle_t task1_handle;//system: PWR status
+  TaskHandle_t task2_handle;//process : read pot.
+
   TaskHandle_t task3_handle;//process: server motor
-  TaskHandle_t task4_handle;//process: stepper motor
+
   TaskHandle_t task5_handle;//process: pump
 
 
@@ -80,12 +80,12 @@ int main(void)
 
    status1= xTaskCreate(task1_handler, "Task-1", configMINIMAL_STACK_SIZE, NULL,4, &task1_handle);
     configASSERT(status1 == pdPASS);
-   status1= xTaskCreate(task2_handler, "Task-2", configMINIMAL_STACK_SIZE, NULL,4, &task2_handle);
-    configASSERT(status1 == pdPASS);
+    status1= xTaskCreate(task2_handler, "Task-2", configMINIMAL_STACK_SIZE, NULL,4, &task2_handle);
+        configASSERT(status1 == pdPASS);
+
    status1= xTaskCreate(task3_handler, "Task-3", configMINIMAL_STACK_SIZE, NULL,4, &task3_handle);
     configASSERT(status1 == pdPASS);
-   status1= xTaskCreate(task4_handler, "Task-4", configMINIMAL_STACK_SIZE, NULL,4, &task4_handle);
-     configASSERT(status1 == pdPASS);
+
    status1= xTaskCreate(task5_handler, "Task-5", configMINIMAL_STACK_SIZE, NULL,4, &task5_handle);
      configASSERT(status1 == pdPASS);
 
@@ -113,60 +113,21 @@ static void task1_handler(void *parameters){
 	}
 }
 
-//stepper motor control: calibration
 static void task2_handler(void *parameters){
 	while(1)
 	{
-		//--[Calibration in left direction]
-		if((GPIOB->IDR & (1<<15)) && left_limit_status <  1)
+		HAL_ADC_Start(&hadc1);
+		HAL_ADC_PollForConversion(&hadc1,20);
+		my_adc = HAL_ADC_GetValue(&hadc1); // set to a bit resolution: 0 -254
+
+		//clamp adc delay value to  >= 1000ms
+		if (my_adc / 10 >= 1)
 		{
-			HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1);
-			vTaskDelay(pdMS_TO_TICKS(10));
-
-			stepper_counter++;
-
+			my_adc_delay = ( my_adc / 10 ) * 1000;
 		}
-		else if(!(GPIOB->IDR & (1<<15)) && left_limit_status < 1)
+		else if(my_adc / 10 <  1)
 		{
-			//HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
-			vTaskDelay(pdMS_TO_TICKS(10));
-
-			left_limit_value = stepper_counter;
-			left_limit_status =1;
-
-		}
-
-		//--[Calibrate in opposite direction]
-		else if ((GPIOB->IDR & (1<<14)) && left_limit_status ==  1)
-		{
-
-			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);//enable stepper motor driver pin to turn right
-			//HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);//enable stepper motor driver pin to turn right
-			HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1);
-			vTaskDelay(pdMS_TO_TICKS(10));
-			stepper_counter++;
-		}
-
-		else if(!(GPIOB->IDR & (1<<14)) && left_limit_status == 1)
-		{
-			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
-			vTaskDelay(pdMS_TO_TICKS(10));
-
-			right_limit_value = stepper_counter;
-			left_limit_status =2;
-			right_limit_status = 1;
-
-
-		}
-
-		//--[Calibration for end-stops is complete:update status]
-		else if(!(GPIOB->IDR & (1<<14)) && left_limit_status == 2 && right_limit_status == 1)
-		{
-			//HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
-			vTaskDelay(pdMS_TO_TICKS(10));
-			stepper_status = 1; // =1 calibration complete
-			process_step = 1;
-			vTaskDelete(NULL);
+			my_adc_delay = 1000; // clamp to 1000ms
 		}
 
 	}
@@ -182,101 +143,63 @@ static void task3_handler(void *parameters){
 //				HAL_Delay(500);
 //		htim4.Instance->CCR1 =125;
 //		HAL_Delay(500);
-		if(process_step == 1 )
-		{
-			xSemaphoreTake(xMutex1, portMAX_DELAY == 1);
-			//HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
 			pump_status = 1;
+			//HAL_Delay(100);
+			xSemaphoreTake(xMutex1, portMAX_DELAY == 1);
+
+
 			for( int i = 0 ; i < 190; i++)
 			{
 				htim4.Instance->CCR1 =i;
 				HAL_Delay(50);
 			}
-			process_step =2 ;//servo-motor doses product
+
 			xSemaphoreGive(xMutex1);
-
-		}
-	//	HAL_Delay(3000);
-
-		if(process_step == 3 )
-		{
-			xSemaphoreTake(xMutex1, portMAX_DELAY == 1);
-			//HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
 			pump_status = 0;
+
+			//HAL_Delay(SERVO_DELAY);
+			HAL_Delay(my_adc_delay);
+
+			pump_status = 1;
+			//HAL_Delay(100);
+			xSemaphoreTake(xMutex1, portMAX_DELAY == 1);
+
+			//HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
+
 			for( int i = 190 ; i > 0; i--)
 			{
 				htim4.Instance->CCR1 =i;
-				HAL_Delay(5);
+				HAL_Delay(50);
 			}
-			process_step = 1;
-			//HAL_Delay(2000);
+
+
 			xSemaphoreGive(xMutex1);
-		}
-	}
-}
-
-
-
-static void task4_handler(void *parameters){
-	while(1)
-	{
-		//
-		//calibration ends at right limit so turn left
-		if(stepper_status == 1 && (GPIOB->IDR & (1<<15)) && process_step == 2  )
-		{
-			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET); //go in left direction
-			HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1);
-			vTaskDelay(pdMS_TO_TICKS(10));
-
-
-			stepper_counter--;
-			//HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
 			pump_status = 0;
-			if (stepper_counter <= left_limit_value || !(GPIOB->IDR & (1<<15)))
-				{
-					stepper_status = 2; //turn right
-				}
-
-		}
-
-		//turn right
-		else if(stepper_status == 2 && (GPIOB->IDR & (1<<14)))
-		{
-					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET); //go in right direction
-					HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1);
-					vTaskDelay(pdMS_TO_TICKS(10));
-
-					stepper_counter++;
-
-					if ((stepper_counter >= right_limit_value || !(GPIOB->IDR & (1<<14))))
-						{
-
-							process_step = 3;
-							stepper_status = 1;
-						}
-
-
-		}
-
-		else if(!(GPIOB->IDR & (1<<14)) || !(GPIOB->IDR & (1<<15)))
-				{
-				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); //stop stepper motor when reaching end stops
-				}
-
+			//HAL_Delay(SERVO_DELAY);
+			HAL_Delay(my_adc_delay);
 	}
 }
+
+
+
 
 static void task5_handler(void *parameters){
 	while(1)
 	{
+
 		if(pump_status == 0 )
 		{
-			HAL_Delay(1500);
+			//HAL_Delay(1500); // <---- ????
 			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
 		}
 
 		else if (pump_status == 1)
+		{
 		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+		}
+
 
 	}
 
@@ -325,6 +248,58 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_8B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_12;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
